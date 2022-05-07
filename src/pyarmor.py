@@ -8,1593 +8,614 @@
 #                                                           #
 #      pyarmor                                              #
 #                                                           #
-#      Version: 3.4.0 -                                     #
+#      Version: 4.3.2 -                                     #
 #                                                           #
 #############################################################
 #
 #
-#  @File: pyarmor.py
+#  @File: packer.py
 #
 #  @Author: Jondy Zhao(jondy.zhao@gmail.com)
 #
-#  @Create Date: 2018/01/17
+#  @Create Date: 2018/11/08
 #
 #  @Description:
 #
-#   A tool used to import or run obfuscated python scripts.
+#   Pack obfuscated Python scripts with PyInstaller
+#
+#   The prefer way is
+#
+#       pip install pyinstaller
+#       cd /path/to/src
+#       parmor pack hello.py
 #
 
-'''PyArmor is a command line tool used to obfuscate python scripts,
-bind obfuscated scripts to fixed machine or expire obfuscated scripts.
+'''
+Pack obfuscated scripts to one bundle, distribute the bundle as a
+folder or file to other people, and they can execute your program
+without Python installed.
 
 '''
 
 import logging
 import os
+import re
 import shutil
-import subprocess
 import sys
-import time
 
-# argparse is new in Python 2.7, and not in 3.0, 3.1
-# Besides no command aliases supported by Python 2.7
+from codecs import open as codecs_open
+from distutils.util import get_platform
+from glob import glob
+from json import load as json_load
+from py_compile import compile as compile_file
+from shlex import split
+from subprocess import Popen, PIPE, STDOUT
+from zipfile import PyZipFile
+
 import polyfills.argparse as argparse
 
-from config import version, version_info, purchase_info, buy_url, help_url, \
-                   config_filename, capsule_filename, license_filename
+# Default output path, library name, command options for setup script
+DEFAULT_PACKER = {
+    'py2app': ('dist', 'library.zip', ['py2app', '--dist-dir']),
+    'py2exe': ('dist', 'library.zip', ['py2exe', '--dist-dir']),
+    'PyInstaller': ('dist', '', ['-m', 'PyInstaller', '--distpath']),
+    'cx_Freeze': (
+        os.path.join(
+            'build', 'exe.%s-%s' % (get_platform(), sys.version[0:3])),
+        'python%s%s.zip' % sys.version_info[:2],
+        ['build', '--build-exe'])
+}
 
 
-from project import Project
-from utils import make_capsule, make_runtime, relpath, make_bootstrap_script,\
-                  make_license_key, make_entry, show_hd_info, copy_runtime, \
-                  build_path, make_project_command, get_registration_code, \
-                  pytransform_bootstrap, encrypt_script, search_plugins, \
-                  get_platform_list, download_pytransform, update_pytransform,\
-                  check_cross_platform, compatible_platform_names, \
-                  get_name_suffix, get_bind_key, make_super_bootstrap, \
-                  make_protection_code, DEFAULT_CAPSULE, PYARMOR_PATH, \
-                  get_product_key, is_pyscript, is_trial_version
-from register import activate_regcode, register_keyfile, query_keyinfo
-
-import packer
+def logaction(func):
+    def wrap(*args, **kwargs):
+        logging.info('%s', func.__name__)
+        return func(*args, **kwargs)
+    return wrap
 
 
-def arcommand(func):
-    return func
-
-
-def _format_entry(entry, src):
-    if entry:
-        result = []
-        for x in entry.split(','):
-            x = x.strip()
-            if os.path.exists(os.path.join(src, x)):
-                result.append(relpath(os.path.join(src, x), src))
-            elif os.path.exists(x):
-                result.append(relpath(os.path.abspath(x), src))
-            else:
-                raise RuntimeError('No entry script %s found' % x)
-        return ','.join(result)
-
-
-def _check_advanced_value(advanced):
-    pyver = '.'.join([str(x) for x in sys.version_info[:2]])
-    if pyver in ('2.7', '3.7', '3.8', '3.9', '3.10'):
-        if pyver in ('3.10',) and advanced not in (0, 2):
-            raise RuntimeError('Only "--advanced 2" is available for Python %s'
-                               % pyver)
-        if pyver == '2.7' and advanced == 5:
-            raise RuntimeError('"--advanced 5" is not available for Python %s'
-                               % pyver)
-        if advanced in (1, 3):
-            logging.warning('"--advanced %d" is deprecated for Python %s, '
-                            'use "--advanced 2" instead'
-                            % (advanced, pyver))
-    elif advanced in (2, 4, 5):
-        raise RuntimeError('Python %s does not support super mode' % pyver)
-
-
-@arcommand
-def _init(args):
-    '''Create a project to manage the obfuscated scripts.'''
-    path = os.path.normpath(args.project)
-
-    logging.info('Create project in %s ...', path)
-    if os.path.exists(os.path.join(path, config_filename)):
-        raise RuntimeError('A project already exists in "%s"' % path)
-    if not os.path.exists(path):
-        logging.info('Make project directory %s', path)
-        os.makedirs(path)
-
-    if os.path.isabs(args.src):
-        pro_src = src = os.path.normpath(args.src)
+def run_command(cmdlist, verbose=True):
+    logging.info('\n\n%s\n\n', ' '.join(
+        [x if x.find(' ') == -1 else ('"%s"' % x) for x in cmdlist]))
+    if verbose:
+        sep = '=' * 20
+        logging.info('%s Run command %s', sep, sep)
+        p = Popen(cmdlist)
+        p.wait()
+        if p.returncode != 0:
+            raise RuntimeError('Run command failed')
+        logging.info('%s End command %s\n', sep, sep)
     else:
-        src = os.path.abspath(args.src)
-        pro_src = relpath(src, path)
-    logging.info('Python scripts base path: %s', src)
-    logging.info('Project src is: %s', pro_src)
+        p = Popen(cmdlist, stdout=PIPE, stderr=STDOUT)
+        output, _ = p.communicate()
+        if p.returncode != 0:
+            raise RuntimeError(output.decode())
 
-    if args.entry:
-        args.entry = _format_entry(args.entry, src)
-        logging.info('Format entry: %s', args.entry)
 
-    name = os.path.basename(os.path.abspath(path))
-    if (args.type == 'pkg') or (args.type == 'auto' and args.entry
-                                and args.entry.endswith('__init__.py')):
-        logging.info('Project is configured as package')
-        if args.entry is None:
-            logging.info('Entry script is set to "__init__.py" implicitly')
-        project = Project(name=name, title=name, src=pro_src, is_package=1,
-                          entry='__init__.py' if args.entry is None
-                          else args.entry)
-    else:
-        logging.info('Project is configured as standalone application.')
-        project = Project(name=name, title=name, src=pro_src, entry=args.entry)
-
-    logging.info('Create configure file ...')
-    filename = os.path.join(path, config_filename)
-    project.save(path)
-    logging.info('Configure file %s created', filename)
-
-    if sys.argv[0] == 'pyarmor.py':
-        logging.info('Create pyarmor command ...')
-        platname = sys.platform
-        s = make_project_command(platname, sys.executable, sys.argv[0], path)
-        logging.info('PyArmor command %s created', s)
-
-    logging.info('Project init successfully.')
-
-
-@arcommand
-def _config(args):
-    '''Update project settings.'''
-    for x in ('obf-module-mode', 'obf-code-mode', 'disable-restrict-mode'):
-        if getattr(args, x.replace('-', '_')) is not None:
-            logging.warning('Option --%s has been deprecated', x)
-
-    project = Project()
-    project.open(args.project)
-    logging.info('Update project %s ...', args.project)
-
-    def _relpath(p):
-        return p if os.path.isabs(p) \
-            else relpath(os.path.abspath(p), project._path)
-
-    if args.src is not None:
-        args.src = _relpath(args.src)
-        logging.info('Format src to %s', args.src)
-    if args.output is not None:
-        args.output = _relpath(args.output)
-        logging.info('Format output to %s', args.output)
-    if args.license_file is not None:
-        args.license_file = _relpath(args.license_file)
-        logging.info('Format license file to %s', args.license_file)
-    if args.entry:
-        src = os.path.abspath(args.src) if args.src else project.src
-        args.entry = _format_entry(args.entry, src)
-        logging.info('Format entry: %s', args.entry)
-    if args.capsule is not None:
-        logging.warning('The capsule %s is ignored', args.capsule)
-    if args.plugins is not None:
-        if ('clear' in args.plugins) or ('' in args.plugins):
-            logging.info('Clear all plugins')
-            args.plugins = []
-    if args.platforms is not None:
-        if '' in args.platforms:
-            logging.info('Clear platforms')
-            args.platform = ''
-        else:
-            args.platform = ','.join(args.platforms)
-    if args.disable_restrict_mode is not None:
-        if args.restrict_mode is not None:
-            logging.warning('Option --disable_restrict_mode is ignored')
-        else:
-            args.restrict_mode = 0 if args.disable_restrict_mode else 1
-    keys = project._update(dict(args._get_kwargs()))
-    for k in keys:
-        logging.info('Change project %s to "%s"', k, getattr(project, k))
-
-    if keys:
-        project.save(args.project)
-        logging.info('Update project OK.')
-    else:
-        logging.info('Nothing changed.')
-
-
-@arcommand
-def _info(args):
-    '''Show project information.'''
-    project = Project()
-    project.open(args.project)
-    logging.info('Project %s information\n%s', args.project, project.info())
-
-
-@arcommand
-def _build(args):
-    '''Build project, obfuscate all scripts in the project.'''
-    project = Project()
-    project.open(args.project)
-    logging.info('Build project %s ...', args.project)
-
-    logging.info('Check project')
-    project.check()
-
-    suffix = get_name_suffix() if project.get('enable_suffix', 0) else ''
-    capsule = project.get('capsule', DEFAULT_CAPSULE)
-    logging.info('Use capsule: %s', capsule)
-
-    output = project.output if args.output is None \
-        else os.path.normpath(args.output)
-    logging.info('Output path is: %s', output)
-
-    if args.platforms:
-        platforms = [] if '' in args.platforms else args.platforms
-    elif project.get('platform'):
-        platforms = project.get('platform').split(',')
-    else:
-        platforms = []
-
-    restrict = project.get('restrict_mode',
-                           0 if project.get('disable_restrict_mode') else 1)
-    advanced = (project.advanced_mode if project.advanced_mode else 0) \
-        if hasattr(project, 'advanced_mode') else 0
-
-    rsettings = _check_runtime_settings(args.runtime)
-    if rsettings:
-        platforms, advanced, suffix = rsettings[:3]
-
-    _check_advanced_value(advanced)
-    sppmode, advanced = (1, 2) if advanced == 5 else (False, advanced)
-
-    supermode = advanced in (2, 4)
-    vmenabled = advanced in (3, 4)
-
-    platforms = compatible_platform_names(platforms)
-    logging.info('Taget platforms: %s', platforms)
-    platforms = check_cross_platform(platforms, supermode, vmenabled)
-
-    protection = project.cross_protection \
-        if hasattr(project, 'cross_protection') else 1
-
-    bootstrap_code = project.get('bootstrap_code', 1)
-    relative = True if bootstrap_code == 3 else \
-        False if (bootstrap_code == 2 or
-                  (args.no_runtime and bootstrap_code == 1)) else \
-        False if supermode else None
-
-    routput = output if (args.output is not None and args.only_runtime) \
-        else os.path.join(output, os.path.basename(project.src)) \
-        if project.get('is_package') else output
-    licfile = args.license_file if args.license_file is not None \
-        else project.license_file
-    if not restrict:
-        if not licfile:
-            licfile = 'no-restrict'
-        else:
-            raise RuntimeError(
-                'Option "--restrict 0" is conflicted with outer license, '
-                'do not use this option but generate the outer license '
-                'with option "--disable-restrict-mode"'
-            )
-
-    if args.no_runtime:
-        if protection == 1:
-            logging.warning('No cross protection because no runtime generated')
-            protection = 0
-    elif args.runtime:
-        if args.runtime[:1] == '@':
-            rpkg, dryrun = args.runtime[1:], True
-        else:
-            rpkg, dryrun = args.runtime, False
-        if protection == 1:
-            protection = os.path.join(rpkg, 'pytransform_protection.py')
-        licfile = _check_runtime_license(rsettings, licfile)
-        copy_runtime(rpkg, routput, licfile=licfile, dryrun=dryrun)
-    else:
-        package = project.get('package_runtime', 0) \
-            if args.package_runtime is None else args.package_runtime
-
-        checklist = make_runtime(capsule, routput, licfile=licfile,
-                                 platforms=platforms, package=package,
-                                 suffix=suffix, supermode=supermode)
-
-        if protection == 1:
-            protection = make_protection_code(
-                (relative, checklist, suffix),
-                multiple=len(platforms) > 1,
-                supermode=supermode)
-
-    if not args.only_runtime:
-        src = project.src
-        if os.path.abspath(output).startswith(src):
-            excludes = ['prune %s' % os.path.abspath(output)[len(src)+1:]]
-        else:
-            excludes = []
-
-        files = project.get_build_files(args.force, excludes=excludes)
-        soutput = os.path.join(output, os.path.basename(src)) \
-            if project.get('is_package') else output
-
-        logging.info('Save obfuscated scripts to "%s"', soutput)
-        if not os.path.exists(soutput):
-            os.makedirs(soutput)
-
-        logging.info('Read product key from capsule')
-        prokey = get_product_key(capsule)
-
-        logging.info('%s increment build',
-                     'Disable' if args.force else 'Enable')
-        logging.info('Search scripts from %s', src)
-
-        logging.info('Obfuscate scripts with mode:')
-        if hasattr(project, 'obf_mod'):
-            obf_mod = project.obf_mod
-        else:
-            obf_mod = project.obf_module_mode == 'des'
-        if hasattr(project, 'wrap_mode'):
-            wrap_mode = project.wrap_mode
-            obf_code = project.obf_code
-        elif project.obf_code_mode == 'wrap':
-            wrap_mode = 1
-            obf_code = 1
-        else:
-            wrap_mode = 0
-            obf_code = 0 if project.obf_code_mode == 'none' else 1
-
-        def v(t):
-            return 'on' if t else 'off'
-        logging.info('Obfuscating the whole module is %s', v(obf_mod))
-        logging.info('Obfuscating each function is %s', v(obf_code))
-        logging.info('Autowrap each code object mode is %s', v(wrap_mode))
-        logging.info('Restrict mode is %s', restrict)
-        logging.info('Advanced value is %s', advanced)
-        logging.info('Super mode is %s', v(supermode))
-        logging.info('Super plus mode is %s', v(sppmode))
-
-        entries = [build_path(s.strip(), project.src)
-                   for s in project.entry.split(',')] if project.entry else []
-        adv_mode = (advanced - 2) if advanced in (3, 4) else advanced
-
-        for x in sorted(files):
-            a, b = os.path.join(src, x), os.path.join(soutput, x)
-            logging.info('\t%s -> %s', x, relpath(b))
-
-            d = os.path.dirname(b)
-            if not os.path.exists(d):
-                os.makedirs(d)
-
-            if not is_pyscript(a):
-                shutil.copy2(a, b)
-                continue
-
-            if hasattr(project, 'plugins'):
-                plugins = search_plugins(project.plugins)
-            else:
-                plugins = None
-
-            if entries and (os.path.abspath(a) in entries):
-                is_entry, pcode = 1, protection
-            else:
-                is_entry, pcode = 0, 0
-
-            encrypt_script(prokey, a, b, obf_code=obf_code, obf_mod=obf_mod,
-                           wrap_mode=wrap_mode, adv_mode=adv_mode,
-                           rest_mode=restrict, entry=is_entry,
-                           protection=pcode, platforms=platforms,
-                           plugins=plugins, rpath=project.runtime_path,
-                           suffix=suffix, sppmode=sppmode)
-
-            if supermode:
-                make_super_bootstrap(a, b, soutput, relative, suffix=suffix)
-
-        logging.info('%d scripts has been obfuscated', len(files))
-        project['build_time'] = time.time()
-        project.save(args.project)
-
-        if (not supermode) and project.entry and bootstrap_code:
-            soutput = os.path.join(output, os.path.basename(project.src)) \
-                if project.get('is_package') else output
-            make_entry(project.entry, project.src, soutput,
-                       rpath=project.runtime_path, relative=relative,
-                       suffix=suffix, advanced=advanced)
-
-    logging.info('Build project OK.')
-
-
-def licenses(name='reg-001', expired=None, bind_disk=None, bind_mac=None,
-             bind_ipv4=None, bind_data=None, key=None, home=None):
-    if home:
-        _set_volatile_home(home)
-    else:
-        _clean_volatile_home()
-
-    pytransform_bootstrap()
-
-    capsule = DEFAULT_CAPSULE
-    if not os.path.exists(capsule):
-        make_capsule(capsule)
-
-    fmt = '' if expired is None else '*TIME:%.0f\n' % (
-        expired if isinstance(expired, (int, float))
-        else float(expired) if expired.find('-') == -1
-        else time.mktime(time.strptime(expired, '%Y-%m-%d')))
-
-    if bind_disk:
-        fmt = '%s*HARDDISK:%s' % (fmt, bind_disk)
-
-    if bind_mac:
-        fmt = '%s*IFMAC:%s' % (fmt, bind_mac)
-
-    if bind_ipv4:
-        fmt = '%s*IFIPV4:%s' % (fmt, bind_ipv4)
-
-    fmt = fmt + '*CODE:'
-    extra_data = '' if bind_data is None else (';' + bind_data)
-
-    return make_license_key(capsule, fmt + name + extra_data, key=key)
-
-
-@arcommand
-def _licenses(args):
-    '''Generate licenses for obfuscated scripts.'''
-    for x in ('bind-file',):
-        if getattr(args, x.replace('-', '_')) is not None:
-            logging.warning('Option --%s has been deprecated', x)
-
-    capsule = DEFAULT_CAPSULE if args.capsule is None else args.capsule
-    if not os.path.exists(capsule):
-        logging.info('Generating public capsule ...')
-        make_capsule(capsule)
-
-    if os.path.exists(os.path.join(args.project, config_filename)):
-        logging.info('Generate licenses for project %s ...', args.project)
-        project = Project()
-        project.open(args.project)
-    else:
-        if args.project != '':
-            logging.warning('Ignore option --project, there is no project')
-        logging.info('Generate licenses with capsule %s ...', capsule)
-        project = dict(restrict_mode=args.restrict)
-
-    output = args.output
-    licpath = os.path.join(args.project, 'licenses') if output is None \
-        else os.path.dirname(output) if output.endswith(license_filename) \
-        else output
-    if os.path.exists(licpath):
-        logging.info('Output path of licenses: %s', licpath)
-    elif licpath not in ('stdout', 'stderr'):
-        logging.info('Make output path of licenses: %s', licpath)
-        os.mkdir(licpath)
-
-    fmt = '' if args.expired is None else '*TIME:%.0f\n' % (
-        float(args.expired) if args.expired.find('-') == -1
-        else time.mktime(time.strptime(args.expired, '%Y-%m-%d')))
-
-    flags = 0
-    restrict_mode = 0 if args.disable_restrict_mode else args.restrict
-    period_mode = 1 if args.enable_period_mode else 0
-    if restrict_mode:
-        logging.info('The license file is generated in restrict mode')
-    else:
-        logging.info('The license file is generated in restrict mode disabled')
-        flags |= 1
-    if period_mode:
-        logging.info('The license file is generated in period mode')
-        flags |= 2
-    else:
-        logging.info('The license file is generated in period mode disabled')
-
-    if flags:
-        fmt = '%s*FLAGS:%c' % (fmt, chr(flags))
-
-    if args.bind_disk:
-        fmt = '%s*HARDDISK:%s' % (fmt, args.bind_disk)
-
-    if args.bind_mac:
-        fmt = '%s*IFMAC:%s' % (fmt, args.bind_mac)
-
-    if args.bind_ipv4:
-        fmt = '%s*IFIPV4:%s' % (fmt, args.bind_ipv4)
-
-    # if args.bind_ipv6:
-    #     fmt = '%s*IFIPV6:%s' % (fmt, args.bind_ipv6)
-
-    if args.bind_domain:
-        fmt = '%s*DOMAIN:%s' % (fmt, args.bind_domain)
-
-    if args.fixed:
-        keylist = args.fixed.split(',')
-        if keylist[0] in ('1', ''):
-            keylist[0] = '0123456789'
-        fmt = '%s*FIXKEY:%s;' % (fmt, ','.join(keylist))
-
-    if args.bind_file:
-        if args.bind_file.find(';') == -1:
-            bind_file, target_file = args.bind_file, ''
-        else:
-            bind_file, target_file = args.bind_file.split(';', 2)
-        bind_key = get_bind_key(bind_file)
-        fmt = '%s*FIXKEY:%s;%s;' % (fmt, target_file, bind_key)
-
-    # Prefix of registration code
-    fmt = fmt + '*CODE:'
-    extra_data = '' if args.bind_data is None else (';' + args.bind_data)
-
-    if not args.codes:
-        args.codes = ['regcode-01']
-
-    for rcode in args.codes:
-        if args.output in ('stderr', 'stdout'):
-            licfile = args.output
-        elif args.output and args.output.endswith(license_filename):
-            licfile = args.output
-        else:
-            output = os.path.join(licpath, rcode)
-            if not os.path.exists(output):
-                logging.info('Make path: %s', output)
-                os.mkdir(output)
-            licfile = os.path.join(output, license_filename)
-        licode = fmt + rcode + extra_data
-        txtinfo = licode.replace('\n', r'\n')
-        if args.expired:
-            txtinfo = '"Expired:%s%s"' % (args.expired,
-                                          txtinfo[txtinfo.find(r'\n')+2:])
-        logging.info('Generate license: %s', txtinfo)
-        make_license_key(capsule, licode, licfile, legency=args.legency)
-        logging.info('Write license file: %s', licfile)
-
-        if licfile not in ('stderr', 'stdout'):
-            logging.info('Write information to %s.txt', licfile)
-            with open(os.path.join(licfile + '.txt'), 'w') as f:
-                f.write(txtinfo)
-
-    logging.info('Generate %d licenses OK.', len(args.codes))
-
-
-@arcommand
-def _capsule(args):
-    '''Generate public capsule explicitly.'''
-    capsule = os.path.join(args.path, capsule_filename)
-    if args.force or not os.path.exists(capsule):
-        logging.info('Generating public capsule ...')
-        make_capsule(capsule)
-    else:
-        logging.info('Do nothing, capsule %s already exists', capsule)
-
-
-@arcommand
-def _obfuscate(args):
-    '''Obfuscate scripts without project.'''
-    rsettings = _check_runtime_settings(args.runtime)
-    if rsettings:
-        platforms, advanced, suffix = rsettings[:3]
-    else:
-        platforms = args.platforms
-        advanced = args.advanced if args.advanced else 0
-        suffix = get_name_suffix() if args.enable_suffix else ''
-
-    _check_advanced_value(advanced)
-    sppmode, advanced = (1, 2) if advanced == 5 else (False, advanced)
-
-    supermode = advanced in (2, 4)
-    vmenabled = advanced in (3, 4)
-    restrict = args.restrict
-
-    platforms = compatible_platform_names(platforms)
-    logging.info('Target platforms: %s', platforms if platforms else 'Native')
-    platforms = check_cross_platform(platforms, supermode, vmenabled)
-
-    for x in ('entry',):
-        if getattr(args, x.replace('-', '_')) is not None:
-            logging.warning('Option --%s has been deprecated', x)
-
-    if args.src is None:
-        if is_pyscript(args.scripts[0]):
-            path = os.path.abspath(os.path.dirname(args.scripts[0]))
-        else:
-            path = os.path.abspath(args.scripts[0])
-            args.src = path
-            if len(args.scripts) > 1:
-                raise RuntimeError('Only one path is allowed')
-            args.scripts = []
-    else:
-        for s in args.scripts:
-            if not is_pyscript(s):
-                raise RuntimeError('Only one path is allowed')
-            if os.path.isabs(s):
-                raise RuntimeError('Script must be relative path '
-                                   'if --src is specifed')
-        args.scripts = [os.path.join(args.src, x) for x in args.scripts]
-        path = os.path.abspath(args.src)
-    if not os.path.exists(path):
-        raise RuntimeError('Not found source path: %s' % path)
-    logging.info('Source path is "%s"', path)
-
-    entries = [args.entry] if args.entry else args.scripts
-    logging.info('Entry scripts are %s', entries)
-
-    capsule = args.capsule if args.capsule else DEFAULT_CAPSULE
-    if os.path.exists(capsule):
-        logging.info('Use cached capsule %s', capsule)
-    else:
-        logging.info('Generate capsule %s', capsule)
-        make_capsule(capsule)
-
-    output = args.output
-    if os.path.abspath(output) == path:
-        raise RuntimeError('Output path can not be same as src')
-    if args.in_place:
-        logging.debug('Obfuscate the scripts inplace')
-        output = path
-
-    if args.recursive:
-        logging.info('Search scripts mode: Recursive')
-        pats = ['global-include *.py']
-
-        if args.exclude:
-            for item in args.exclude:
-                for x in item.split(','):
-                    if is_pyscript(x):
-                        logging.info('Exclude pattern "%s"', x)
-                        pats.append('exclude %s' % x)
-                    else:
-                        logging.info('Exclude path "%s"', x)
-                        pats.append('prune %s' % x)
-
-        if os.path.abspath(output).startswith(path) and not args.in_place:
-            x = os.path.abspath(output)[len(path):].strip('/\\')
-            pats.append('prune %s' % x)
-            logging.info('Auto exclude output path "%s"', x)
-
-        if hasattr('', 'decode'):
-            try:
-                pats = [p.decode() for p in pats]
-            except UnicodeDecodeError:
-                pats = [p.decode('utf-8') for p in pats]
-
-        files = Project.build_manifest(pats, path)
-
-    elif args.exact:
-        logging.info('Search scripts mode: Exact')
-        files = [os.path.abspath(x) for x in args.scripts]
-
-    else:
-        logging.info('Search scripts mode: Normal')
-        files = Project.build_globfiles(['*.py'], path)
-
-    logging.info('Save obfuscated scripts to "%s"', output)
-    if not os.path.exists(output):
-        os.makedirs(output)
-
-    logging.info('Read product key from capsule')
-    prokey = get_product_key(capsule)
-
-    cross_protection = 0 if args.no_cross_protection else \
-        1 if args.cross_protection is None else args.cross_protection
-
-    n = args.bootstrap_code
-    relative = True if n == 3 else False if n == 2 else \
-        False if supermode else None
-    bootstrap = (not args.no_bootstrap) and n
-    elist = [os.path.abspath(x) for x in entries]
-
-    logging.info('Obfuscate module mode is %s', args.obf_mod)
-    logging.info('Obfuscate code mode is %s', args.obf_code)
-    logging.info('Wrap mode is %s', args.wrap_mode)
-    logging.info('Restrict mode is %d', restrict)
-    logging.info('Advanced value is %d', advanced)
-    logging.info('Super mode is %s', supermode)
-    logging.info('Super plus mode is%s enabled', '' if sppmode else ' not')
-
-    licfile = args.license_file
-    if not restrict:
-        if not licfile:
-            licfile = 'no-restrict'
-        else:
-            raise RuntimeError(
-                'Option "--restrict 0" is conflicted with outer license, '
-                'do not use this option but generate the outer license '
-                'with option "--disable-restrict-mode"'
-            )
-
-    if args.no_runtime:
-        if cross_protection == 1:
-            logging.warning('No cross protection because no runtime generated')
-            cross_protection = 0
-    elif args.runtime:
-        if args.runtime[:1] == '@':
-            rpkg, dryrun = args.runtime[1:], True
-        else:
-            rpkg, dryrun = args.runtime, False
-        if cross_protection == 1:
-            cross_protection = os.path.join(rpkg, 'pytransform_protection.py')
-        licfile = _check_runtime_license(rsettings, licfile)
-        copy_runtime(rpkg, output, licfile=licfile, dryrun=dryrun)
-    else:
-        package = args.package_runtime
-        checklist = make_runtime(capsule, output, platforms=platforms,
-                                 licfile=licfile, package=package,
-                                 suffix=suffix, supermode=supermode)
-
-        if cross_protection == 1:
-            cross_protection = make_protection_code(
-                (relative, checklist, suffix),
-                multiple=len(platforms) > 1,
-                supermode=supermode)
-
-    logging.info('Start obfuscating the scripts...')
-    adv_mode = (advanced - 2) if advanced in (3, 4) else advanced
-    for x in sorted(files):
-        if os.path.isabs(x):
-            a, b = x, os.path.join(output, os.path.basename(x))
-        else:
-            a, b = os.path.join(path, x), os.path.join(output, x)
-        logging.info('\t%s -> %s', x, relpath(b))
-        is_entry = os.path.abspath(a) in elist
-        protection = is_entry and cross_protection
-        plugins = search_plugins(args.plugins)
-
-        d = os.path.dirname(b)
-        if not os.path.exists(d):
-            os.makedirs(d)
-
-        encrypt_script(prokey, a, b, wrap_mode=args.wrap_mode,
-                       obf_code=args.obf_code, obf_mod=args.obf_mod,
-                       adv_mode=adv_mode, rest_mode=restrict, entry=is_entry,
-                       protection=protection, platforms=platforms,
-                       plugins=plugins, suffix=suffix, sppmode=sppmode)
-
-        if supermode:
-            make_super_bootstrap(a, b, output, relative, suffix=suffix)
-        elif is_entry and bootstrap:
-            name = os.path.abspath(a)[len(path)+1:]
-            make_entry(name, path, output, relative=relative, suffix=suffix,
-                       advanced=advanced)
-
-    logging.info('Obfuscate %d scripts OK.', len(files))
-
-
-@arcommand
-def _check(args):
-    '''Check consistency of project.'''
-    project = Project()
-    project.open(args.project)
-    logging.info('Check project %s ...', args.project)
-    project.check()
-    logging.info('Check project OK.')
-
-
-@arcommand
-def _benchmark(args):
-    '''Run benchmark test in current machine.'''
-    logging.info('Python version: %d.%d', *sys.version_info[:2])
-    logging.info('Start benchmark test ...')
-    logging.info('Obfuscate module mode: %s', args.obf_mod)
-    logging.info('Obfuscate code mode: %s', args.obf_code)
-    logging.info('Obfuscate wrap mode: %s', args.wrap_mode)
-    logging.info('Obfuscate advanced value: %s', args.adv_mode)
-
-    logging.info('Benchmark bootstrap ...')
-    path = os.path.normpath(os.path.dirname(__file__))
-    p = subprocess.Popen(
-        [sys.executable, 'benchmark.py', 'bootstrap', str(args.obf_mod),
-         str(args.obf_code), str(args.wrap_mode), str(args.adv_mode)],
-        cwd=path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    p.wait()
-    logging.info('Benchmark bootstrap OK.')
-
-    logging.info('Run benchmark test ...')
-    benchtest = os.path.join(path, '.benchtest')
-    p = subprocess.Popen([sys.executable, 'benchmark.py'], cwd=benchtest)
-    p.wait()
-
-    if args.debug:
-        logging.info('Test scripts are saved in the path: %s', benchtest)
-    else:
-        logging.info('Remove test path: %s', benchtest)
-        shutil.rmtree(benchtest)
-
-    logging.info('Finish benchmark test.')
-
-
-@arcommand
-def _hdinfo(args):
-    print('')
-    show_hd_info(name=args.devname)
-
-
-@arcommand
-def _register(args):
-    '''Make registration keyfile work, or show registration information.'''
-    if args.buy:
-        from webbrowser import open_new_tab
-        open_new_tab(buy_url)
-        return
-
-    if args.filename is None:
-        msg = _version_info(verbose=1)
-        print(msg)
-        if msg.find('Registration Code') > 0:
-            print('')
-            print('Please send request to "pyarmor@163.com" from '
-                  'the registration email if you would like to '
-                  'change the typos of registration information.')
-        else:
-            print(purchase_info)
-        return
-
-    if args.upgrade and is_trial_version():
-        logging.info('Ignore option --upgrade for trial version')
-        args.upgrade = None
-
-    if args.filename.endswith('.zip'):
-        register_keyfile(args.filename, args.upgrade, legency=args.legency)
-        return
-
-    if args.filename in ('CODE', 'XXX'):
-        raise RuntimeError('Please replace "%s" with purchased registration '
-                           'code which is a long string' % args.filename)
-
-    if args.filename.endswith('.txt'):
-        logging.info('Read registration code file: %s', args.filename)
-        with open(args.filename, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if len(line) == 192 and line.find(' ') == -1:
-                    ucode = line
-                    break
-            else:
-                raise RuntimeError('No valid registration code found '
-                                   'in the file "%s"' % args.filename)
-        logging.debug('Got registration code: %s', ucode)
-    else:
-        ucode = args.filename.strip().replace('\r', '').replace('\n', '')
-
-    if len(ucode) != 192:
-        raise RuntimeError('Invalid code, registration code is an one '
-                           'line string with 192 chars, the length of '
-                           'this code is %d.' % len(ucode))
-
-    logging.info('Start to activate this code')
-    filename = activate_regcode(ucode)
-    logging.info('Got keyfile of this code, this code is activated')
-
-    if args.save:
-        logging.info('The keyfile of this code has been saved to "%s"',
-                     os.path.abspath(filename))
-        return
-
-    register_keyfile(filename, args.upgrade, legency=args.legency)
-
-    logging.debug('Remove temporary keyfile %s', filename)
-    os.remove(filename)
-
-    logging.info('Run "pyarmor register" to check registration information.')
-
-
-@arcommand
-def _download(args):
-    '''List and download platform-dependent dynamic libraries.'''
-    if args.platname:
-        logging.info('Downloading dynamic library for %s', args.platname)
-        download_pytransform(args.platname, output=args.output, url=args.url)
-
-    elif args.update is not None:
-        update_pytransform(args.update)
-
-    else:
-        lines = []
-        plist = get_platform_list()
-        patterns = args.pattern.split('.') if args.pattern else []
-        if patterns:
-            logging.info('Search the available libraries for %s:', patterns)
-        else:
-            if args.pattern is None:
-                if args.help_platform is None:
-                    args.help_platform = ''
-            else:
-                logging.info('All the available libraries:')
-        help_platform = args.help_platform
-        if help_platform is not None:
-            patterns = help_platform.split('.') if help_platform else []
-            if patterns:
-                logging.info('All available platform names for %s:', patterns)
-            else:
-                logging.info('All available standard platform names:')
-
-        def match_platform(item):
-            for pat in patterns:
-                if (pat not in item['id'].split('.')) and \
-                   (pat != item['platform']) and \
-                   (pat not in item['machines']) and \
-                   (pat not in item['features']):
-                    return False
-            return True
-
-        for p in plist:
-            if not match_platform(p):
-                continue
-
-            if help_platform is not None:
-                pname = '\t ' + p['name']
-                if pname not in lines:
-                    lines.append(pname)
-                continue
-
-            lines.append('')
-            lines.append('%16s: %s' % ('id', p['id']))
-            lines.append('%16s: %s' % ('name', p['name']))
-            lines.append('%16s: %s' % ('platform', p['platform']))
-            lines.append('%16s: %s' % ('machines', ', '.join(p['machines'])))
-            lines.append('%16s: %s' % ('features', ', '.join(p['features'])))
-            lines.append('%16s: %s' % ('remark', p['remark']))
-
-        if help_platform is not None:
-            lines.sort()
-        logging.info('\n%s', '\n'.join(lines))
-
-
-@arcommand
-def _runtime(args):
-    '''Generate runtime package separately.'''
-    capsule = DEFAULT_CAPSULE
-    name = 'pytransform_bootstrap'
-    output = os.path.join(args.output, name) if args.inside else args.output
-    package = not args.no_package
-    suffix = get_name_suffix() if args.enable_suffix else ''
-    licfile = 'outer' if args.no_license else args.license_file
-    supermode = args.super_mode or (args.advanced in (2, 4, 5))
-    vmode = args.vm_mode or (args.advanced in (3, 4))
-    platforms = compatible_platform_names(args.platforms)
-    platforms = check_cross_platform(platforms, supermode, vmode=vmode)
-
-    checklist = make_runtime(capsule, output, licfile=licfile,
-                             platforms=platforms, package=package,
-                             suffix=suffix, supermode=supermode)
-
-    logging.info('Generating protection script ...')
-    filename = os.path.join(output, 'pytransform_protection.py')
-    data = make_protection_code((args.inside, checklist, suffix),
-                                multiple=len(platforms) > 1,
-                                supermode=supermode)
-    advanced = args.advanced if args.advanced is not None else \
-        (4 if vmode else 2) if supermode else 3 if vmode else 0
-    header = ('# platforms: %s' % ','.join(platforms),
-              '# advanced: %s' % advanced,
-              '# suffix: %s' % suffix,
-              '# license: %s' % ('default' if licfile is None else licfile),
-              '')
-    with open(filename, 'w') as f:
-        f.write('\n'.join(header))
-        f.write(data)
-    logging.info('Generate protection script "%s" OK', filename)
-
-    if not supermode:
-        filename = os.path.join(output, '__init__.py') if args.inside else \
-            os.path.join(args.output, name + '.py')
-        logging.info('Generating bootstrap script ...')
-        make_bootstrap_script(filename, capsule=capsule, suffix=suffix)
-        logging.info('Generate bootstrap script "%s" OK', filename)
-
-
-@arcommand
-def _help(args):
-    '''Display online documentation, goto man page or questions page.'''
-    if args.lang == 'auto':
-        lang = os.getenv('LANG', '')[:2].lower()
-        if lang not in ('en', 'zh'):
-            lang = 'en'
-    else:
-        lang = args.lang
-
-    page = 'questions.html' if args.command == 'questions' \
-        else ('man.html#%s' % args.command)
-
-    from webbrowser import open_new_tab
-    open_new_tab(help_url.format(lang=lang, page=page))
-
-
-def _check_runtime_settings(path):
-    if path is None:
-        return
-
-    if path[:1] == '@':
-        path = path[1:]
-
-    if not os.path.exists(path):
-        raise RuntimeError('No runtime package at "%s"' % path)
-
-    filename = os.path.join(path, 'pytransform_protection.py')
-    if not os.path.exists(filename):
-        raise RuntimeError('No pytransform_protection.py found '
-                           'in runtime package "%s", please run '
-                           'command `runtime` again' % path)
-
-    with open(filename) as f:
-        lines = f.readline(), f.readline(), f.readline(), f.readline()
-    paras = [line[1:].strip().split(':', 1) for line in lines]
-
-    if not [x[0] for x in paras] == ['platforms', 'advanced',
-                                     'suffix', 'license']:
-        raise RuntimeError('No settings found in runtime package "%s", '
-                           'please run command `runtime` again' % path)
-
-    platforms = paras[0][1].strip()
-    advanced = int(paras[1][1].strip())
-    suffix = paras[2][1].strip()
-    licfile = 'outer' if paras[3][1].strip() == 'outer' else 'embedded'
-
-    logging.info('Got settings from prebuilt runtime path "%s"', path)
-    logging.info('    Platforms: %s', platforms)
-    logging.info('    Advanced: %s', advanced)
-    logging.info('    Suffix: %s', suffix)
-    logging.info('    License: %s', licfile)
-
-    return [platforms] if platforms else '', advanced, suffix, licfile
-
-
-def _check_runtime_license(rsettings, licfile):
-    if rsettings[-1] == 'embedded' and licfile is not None:
-        logging.warning('The runtime package uses embedded license file, '
-                        'the license file "%s" is ignored', licfile)
-        licfile = False
-    elif rsettings[-1] == 'outer' and (
-            licfile is None or licfile in ('no-restrict', 'outer', 'no')):
-        logging.warning('The runtime package uses outer license '
-                        'but no license file is specified')
-        licfile = False
-    elif licfile == 'outer' and rsettings[-1] != 'outer':
-        raise RuntimeError('Please specify outer license in the command '
-                           '`runtime` when using shared runtime files')
-
-    return licfile
-
-
-def _version_info(verbose=2):
-    trial = ' Trial' if is_trial_version() else ''
-    ver = 'PyArmor%s Version %s' % (trial, version)
-    if verbose == 0:
-        return ver
-
-    pytransform_bootstrap()
-    rcode = get_registration_code()
-    info = [ver]
-    if rcode:
-        rcode = rcode.replace('-sn-1.txt', '')
-        info.append('Registration Code: %s' % rcode)
-        info.append(query_keyinfo(rcode))
-    if verbose > 1:
-        info.extend(['', version_info])
-    return '\n'.join(info)
-
-
-def _parser():
-    rmodes = 0, 1, 2, 3, 4, 5, 101, 102, 103, 104, 105
-    parser = argparse.ArgumentParser(
-        prog='pyarmor',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=__doc__,
-        epilog='See "pyarmor <command> -h" for more information '
-               'on a specific command.\n\nMore usage refer to '
-               'https://pyarmor.readthedocs.io'
-    )
-    parser.add_argument('-v', '--version', action='version',
-                        version=_version_info)
-    parser.add_argument('-q', '--silent', action='store_true',
-                        help='Suppress all normal output')
-    parser.add_argument('-d', '--debug', action='store_true',
-                        help='Print exception traceback and debugging message')
-    parser.add_argument('--home', help='Change pyarmor home path')
-    parser.add_argument('--boot', help='Change boot platform')
-
-    subparsers = parser.add_subparsers(
-        title='The most commonly used pyarmor commands are',
-        metavar=''
-    )
-
-    #
-    # Command: obfuscate
-    #
-    cparser = subparsers.add_parser(
-        'obfuscate',
-        aliases=['o'],
-        epilog=_obfuscate.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Obfuscate python scripts')
-    cparser.add_argument('-O', '--output', default='dist', metavar='PATH',
-                         help='Output path, default is "%(default)s"')
-    cparser.add_argument('-r', '--recursive', action='store_true',
-                         help='Search scripts in recursive mode')
-    cparser.add_argument('--exclude', metavar='PATH', action='append',
-                         help='Exclude the path in recursive mode. '
-                         'Multiple paths are allowed, separated by ",". '
-                         'Or use this option multiple times')
-    cparser.add_argument('--exact', action='store_true',
-                         help='Only obfusate list scripts')
-    cparser.add_argument('--no-bootstrap', action='store_true',
-                         help='Do not insert bootstrap code to entry script')
-    cparser.add_argument('--bootstrap', '--bootstrap-code',
-                         dest='bootstrap_code',
-                         type=int, default=1, choices=(0, 1, 2, 3),
-                         help='How to insert bootstrap code to entry script')
-    cparser.add_argument('scripts', metavar='SCRIPT', nargs='+',
-                         help='List scripts to obfuscated, the first script '
-                         'is entry script')
-    cparser.add_argument('-s', '--src', metavar='PATH',
-                         help='Specify source path if entry script is not '
-                         'in the top most path')
-    cparser.add_argument('-e', '--entry', metavar='SCRIPT',
-                         help=argparse.SUPPRESS)
-    cparser.add_argument('--plugin', dest='plugins', metavar='NAME',
-                         action='append',
-                         help='Insert extra code to entry script, '
-                         'it could be used multiple times')
-    cparser.add_argument('--restrict', type=int, choices=rmodes,
-                         default=1, help='Set restrict mode')
-    cparser.add_argument('--capsule', help=argparse.SUPPRESS)
-    cparser.add_argument('--platform', dest='platforms', metavar='NAME',
-                         action='append',
-                         help='Target platform to run obfuscated scripts, '
-                         'use this option multiple times for more platforms')
-    cparser.add_argument('--obf-mod', type=int, choices=(0, 1, 2), default=2)
-    cparser.add_argument('--obf-code', type=int, choices=(0, 1, 2), default=1)
-    cparser.add_argument('--wrap-mode', type=int, choices=(0, 1), default=1)
-    cparser.add_argument('--advanced', type=int, choices=(0, 1, 2, 3, 4, 5),
-                         default=0, help='Enable advanced mode or super mode')
-    cparser.add_argument('--package-runtime', type=int, default=1,
-                         choices=(0, 1), help='Package runtime files or not')
-    cparser.add_argument('-n', '--no-runtime', action='store_true',
-                         help='DO NOT generate runtime files')
-    cparser.add_argument('--runtime', '--with-runtime', dest='runtime',
-                         metavar='PATH', help='Use prebuilt runtime files')
-    cparser.add_argument('--enable-suffix', action='store_true',
-                         help='Make unique runtime files and bootstrap code')
-    cparser.add_argument('--with-license', dest='license_file',
-                         help='Use this license file other than default')
-    group = cparser.add_mutually_exclusive_group()
-    group.add_argument('--no-cross-protection', action='store_true',
-                       help='Do not insert protection code to entry script')
-    group.add_argument('--cross-protection', metavar='SCRIPT',
-                       help='Specify cross protection script')
-    cparser.add_argument('--in-place', action='store_true',
-                         help=argparse.SUPPRESS)
-
-    cparser.set_defaults(func=_obfuscate)
-
-    #
-    # Command: license
-    #
-    cparser = subparsers.add_parser(
-        'licenses',
-        aliases=['l'],
-        epilog=_licenses.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Generate new licenses for obfuscated scripts'
-    )
-    cparser.add_argument('codes', nargs='*', metavar='CODE',
-                         help='Registration code for this license')
-    group = cparser.add_argument_group('Bind license to hardware')
-    group.add_argument('-e', '--expired', metavar='YYYY-MM-DD',
-                       help='Expired date for this license')
-    group.add_argument('-d', '--bind-disk', metavar='SN',
-                       help='Bind license to serial number of harddisk')
-    group.add_argument('-4', '--bind-ipv4', metavar='a.b.c.d',
-                       help='Bind license to ipv4 addr')
-    # group.add_argument('-6', '--bind-ipv6', metavar='a:b:c:d',
-    #                    help='Bind license to ipv6 addr')
-    group.add_argument('-m', '--bind-mac', metavar='x:x:x:x',
-                       help='Bind license to mac addr')
-    group.add_argument('-x', '--bind-data', metavar='DATA', help='Pass extra '
-                       'data to license, used to extend license type')
-    group.add_argument('--bind-domain', metavar='DOMAIN',
-                       help='Bind license to domain name')
-    group.add_argument('--bind-file', metavar='filename',
-                       help=argparse.SUPPRESS)
-    group.add_argument('--fixed',
-                       help='Bind license to python dynamic library')
-    cparser.add_argument('-P', '--project', default='', help=argparse.SUPPRESS)
-    cparser.add_argument('-C', '--capsule', help=argparse.SUPPRESS)
-    cparser.add_argument('-O', '--output', help='Output path, default is '
-                         '`licenses` (`stdout` is also supported)')
-    cparser.add_argument('--disable-restrict-mode', action='store_true',
-                         help='Disable all the restrict modes')
-    cparser.add_argument('--enable-period-mode', action='store_true',
-                         help='Check license periodly (per hour)')
-    cparser.add_argument('--restrict', type=int, choices=(0, 1),
-                         default=1, help=argparse.SUPPRESS)
-    cparser.add_argument('--legency', type=int, choices=(0, 1),
-                         default=0, help=argparse.SUPPRESS)
-
-    cparser.set_defaults(func=_licenses)
-
-    #
-    # Command: pack
-    #
-    cparser = subparsers.add_parser(
-        'pack',
-        aliases=['p'],
-        epilog=packer.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Pack obfuscated scripts to one bundle'
-    )
-    packer.add_arguments(cparser)
-    cparser.set_defaults(func=packer.packer)
-
-    #
-    # Command: init
-    #
-    cparser = subparsers.add_parser(
-        'init',
-        aliases=['i'],
-        epilog=_init.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Create a project to manage obfuscated scripts'
-    )
-    cparser.add_argument('-t', '--type', default='auto',
-                         choices=('auto', 'app', 'pkg'))
-    cparser.add_argument('-e', '--entry',
-                         help='Entry script of this project')
-    cparser.add_argument('-s', '--src', default='',
-                         help='Project src, base path for matching scripts')
-    cparser.add_argument('--capsule', help=argparse.SUPPRESS)
-    cparser.add_argument('project', nargs='?', default='', help='Project path')
-    cparser.set_defaults(func=_init)
-
-    #
-    # Command: config
-    #
-    cparser = subparsers.add_parser(
-        'config',
-        aliases=['c'],
-        epilog=_config.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Update project settings')
-    cparser.add_argument('project', nargs='?', metavar='PATH',
-                         default='', help='Project path')
-    cparser.add_argument('--name')
-    cparser.add_argument('--title')
-    cparser.add_argument('--src',
-                         help='Project src, base path for matching scripts')
-    cparser.add_argument('--output',
-                         help='Output path for obfuscated scripts')
-    cparser.add_argument('--capsule', help=argparse.SUPPRESS)
-    cparser.add_argument('--platform', dest='platforms', metavar='NAME',
-                         action='append',
-                         help='Target platform to run obfuscated scripts, '
-                         'use this option multiple times for more platforms')
-    cparser.add_argument('--manifest', metavar='TEMPLATE',
-                         help='Filter the project scritps by these manifest '
-                         'template commands')
-    cparser.add_argument('--entry', metavar='SCRIPT',
-                         help='Entry script of this project, sperated by "," '
-                         'for multiple entry scripts')
-    cparser.add_argument('--is-package', type=int, choices=(0, 1))
-    cparser.add_argument('--disable-restrict-mode', type=int, choices=(0, 1),
-                         help=argparse.SUPPRESS)
-    cparser.add_argument('--restrict', '--restrict-mode', dest='restrict_mode',
-                         type=int, choices=rmodes,
-                         help='Set restrict mode')
-    cparser.add_argument('--obf-module-mode', choices=Project.OBF_MODULE_MODE,
-                         help=argparse.SUPPRESS)
-    cparser.add_argument('--obf-code-mode', choices=Project.OBF_CODE_MODE,
-                         help=argparse.SUPPRESS)
-    cparser.add_argument('--obf-mod', type=int, choices=(0, 1, 2))
-    cparser.add_argument('--obf-code', type=int, choices=(0, 1, 2))
-    cparser.add_argument('--wrap-mode', type=int, choices=(0, 1))
-    cparser.add_argument('--cross-protection', type=int, choices=(0, 1),
-                         help='Insert cross protection code to entry script '
-                         'or not')
-    cparser.add_argument('--bootstrap', '--bootstrap-code', type=int,
-                         dest='bootstrap_code', choices=(0, 1, 2, 3),
-                         help='How to insert bootstrap code to entry script')
-    cparser.add_argument('--rpath', metavar="RPATH", dest='runtime_path',
-                         help='The path to search dynamic library in runtime, '
-                         'if it is not within the runtime package')
-    cparser.add_argument('--plugin', dest='plugins', metavar='NAME',
-                         action='append',
-                         help='Insert extra code to entry script, '
-                         'it could be used multiple times')
-    cparser.add_argument('--advanced', '--advanced-mode', dest='advanced_mode',
-                         type=int, choices=(0, 1, 2, 3, 4, 5),
-                         help='Enable advanced mode or super mode')
-    cparser.add_argument('--package-runtime', choices=(0, 1), type=int,
-                         help='Package runtime files or not')
-    cparser.add_argument('--enable-suffix', type=int, choices=(0, 1),
-                         help='Make unique runtime files and bootstrap code')
-    cparser.add_argument('--with-license', dest='license_file',
-                         help='Use this license file other than default')
-    # cparser.add_argument('--reset', choices=('all', 'glob', 'exact'),
-    #                      help='Initialize project scripts by different way')
-    # cparser.add_argument('--exclude', dest="exludes", action="append",
-    #                      help='Exclude the path or script from project. '
-    #                      'This option could be used multiple times')
-    cparser.set_defaults(func=_config)
-
-    #
-    # Command: build
-    #
-    cparser = subparsers.add_parser(
-        'build',
-        aliases=['b'],
-        epilog=_build.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Obfuscate all the scripts in the project')
-    cparser.add_argument('project', nargs='?', metavar='PATH', default='',
-                         help='Project path, or project configuratioin file')
-    cparser.add_argument('-B', '--force', action='store_true',
-                         help='Force to obfuscate all scripts, otherwise '
-                         'only obfuscate the changed scripts since last build')
-    cparser.add_argument('-r', '--only-runtime', action='store_true',
-                         help='Generate runtime files only')
-    cparser.add_argument('-n', '--no-runtime', action='store_true',
-                         help='DO NOT generate runtime files')
-    cparser.add_argument('--runtime', '--with-runtime', dest='runtime',
-                         metavar='PATH', help='Use prebuilt runtime files')
-    cparser.add_argument('-O', '--output',
-                         help='Output path, override project configuration')
-    cparser.add_argument('--platform', dest='platforms', metavar='NAME',
-                         action='append',
-                         help='Target platform to run obfuscated scripts, '
-                         'use this option multiple times for more platforms')
-    cparser.add_argument('--package-runtime', choices=(0, 1), type=int,
-                         help='Package runtime files or not')
-    cparser.add_argument('--with-license', dest='license_file',
-                         help='Use this license file other than default')
-    cparser.set_defaults(func=_build)
-
-    #
-    # Command: info
-    #
-    cparser = subparsers.add_parser(
-        'info',
-        epilog=_info.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Show project information'
-    )
-    cparser.add_argument('project', nargs='?', metavar='PATH',
-                         default='', help='Project path')
-    cparser.set_defaults(func=_info)
-
-    #
-    # Command: check
-    #
-    cparser = subparsers.add_parser(
-        'check',
-        epilog=_check.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Check consistency of project')
-    cparser.add_argument('project', nargs='?', metavar='PATH',
-                         default='', help='Project path')
-    cparser.set_defaults(func=_check)
-
-    #
-    # Command: hdinfo
-    #
-    cparser = subparsers.add_parser(
-        'hdinfo',
-        epilog=_hdinfo.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Show all available hardware information'
-    )
-    cparser.add_argument('devname', nargs='?', metavar='NAME',
-                         help='Get information of this device')
-    cparser.set_defaults(func=_hdinfo)
-
-    #
-    # Command: benchmark
-    #
-    cparser = subparsers.add_parser(
-        'benchmark',
-        epilog=_benchmark.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Run benchmark test in current machine'
-    )
-    cparser.add_argument('-m', '--obf-mod', choices=(0, 1, 2),
-                         default=2, type=int)
-    cparser.add_argument('-c', '--obf-code', choices=(0, 1, 2),
-                         default=1, type=int)
-    cparser.add_argument('-w', '--wrap-mode', choices=(0, 1),
-                         default=1, type=int)
-    cparser.add_argument('-a', '--advanced', choices=(0, 1, 2, 3, 4, 5),
-                         default=0, dest='adv_mode', type=int)
-    cparser.add_argument('-d', '--debug', action='store_true',
-                         help='Do not clean the test scripts'
-                              'generated in real time')
-    cparser.set_defaults(func=_benchmark)
-
-    #
-    # Command: capsule
-    #
-    cparser = subparsers.add_parser(
-        'capsule',
-        epilog=_capsule.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        add_help=False)
-    cparser.add_argument('-f', '--force', action='store_true',
-                         help='Force update public capsule even if it exists')
-    cparser.add_argument('path', nargs='?', default=os.path.expanduser('~'),
-                         help='Path to save capsule, default is home path')
-    cparser.set_defaults(func=_capsule)
-
-    #
-    # Command: register
-    #
-    cparser = subparsers.add_parser(
-        'register',
-        epilog=_register.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Make registration keyfile work')
-    cparser.add_argument('-n', '--legency', action='store_true',
-                         help='Store `license.lic` in the traditional way')
-    cparser.add_argument('-b', '--buy', action='store_true',
-                         help='Open web browser to purchase code')
-    cparser.add_argument('-s', '--save', action='store_true',
-                         help=argparse.SUPPRESS)
-    cparser.add_argument('-u', '--upgrade', action='store_true',
-                         help='Upgrade the old license')
-    cparser.add_argument('filename', nargs='?', metavar='KEYFILE',
-                         help='Registration code or keyfile')
-    cparser.set_defaults(func=_register)
-
-    #
-    # Command: download
-    #
-    cparser = subparsers.add_parser(
-        'download',
-        epilog=_download.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Download platform-dependent dynamic libraries')
-    cparser.add_argument('-O', '--output', metavar='PATH',
-                         help='Save downloaded library to this path, default '
-                         'is `~/.pyarmor/platforms`')
-    cparser.add_argument('--url', help=argparse.SUPPRESS)
-    group = cparser.add_mutually_exclusive_group()
-    group.add_argument('--help-platform', nargs='?', const='',
-                       metavar='FILTER',
-                       help='Display all available platform names')
-    group.add_argument('-L', '--list', nargs='?', const='',
-                       dest='pattern', metavar='FILTER',
-                       help='List available dynamic libraries in details')
-    group.add_argument('-u', '--update', nargs='?', const='*', metavar='NAME',
-                       help='Update all the downloaded dynamic libraries')
-    group.add_argument('platname', nargs='?', metavar='NAME',
-                       help='Download dynamic library for this platform')
-    cparser.set_defaults(func=_download)
-
-    #
-    # Command: runtime
-    #
-    cparser = subparsers.add_parser(
-        'runtime',
-        epilog=_runtime.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Generate runtime package separately')
-    cparser.add_argument('-O', '--output', metavar='PATH', default='dist',
-                         help='Output path, default is "%(default)s"')
-    cparser.add_argument('-n', '--no-package', action='store_true',
-                         help='Generate runtime files without package')
-    cparser.add_argument('-i', '--inside', action='store_true',
-                         help='Generate bootstrap script which is used '
-                         'inside one package')
-    cparser.add_argument('-L', '--with-license', metavar='FILE',
-                         dest='license_file',
-                         help='Replace default license with this file')
-    cparser.add_argument('--without-license', dest='no_license',
-                         action='store_true', help=argparse.SUPPRESS)
-    cparser.add_argument('--platform', dest='platforms', metavar='NAME',
-                         action='append',
-                         help='Generate runtime package for this platform, '
-                         'use this option multiple times for more platforms')
-    cparser.add_argument('--enable-suffix', action='store_true',
-                         help='Make unique runtime files and bootstrap code')
-    cparser.add_argument('--super-mode', action='store_true',
-                         help=argparse.SUPPRESS)
-    cparser.add_argument('--vm-mode', action='store_true',
-                         help=argparse.SUPPRESS)
-    cparser.add_argument('--advanced', type=int, choices=range(6),
-                         help='Enable advanced mode or super mode')
-    cparser.add_argument('pkgname', nargs='?', default='pytransform',
-                         help=argparse.SUPPRESS)
-    cparser.set_defaults(func=_runtime)
-
-    #
-    # Command: man
-    #
-    cparser = subparsers.add_parser(
-        'help',
-        epilog=_help.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Display online documentation')
-    cparser.add_argument('-L', '--lang', default='auto',
-                         choices=('auto', 'en', 'zh'),
-                         help='Default is "%(default)s"')
-    cparser.add_argument('command', nargs='?',
-                         choices=('obfuscate', 'licenses', 'init', 'config',
-                                  'build', 'info', 'hdinfo', 'runtime',
-                                  'register', 'questions'),
-                         help='Goto man page or questions page')
-    cparser.set_defaults(func=_help)
-
-    return parser
-
-
-def excepthook(type, exc, traceback):
+def relpath(path, start=os.curdir):
     try:
-        msg = exc.args[0] % exc.args[1:]
+        r = os.path.relpath(path, start)
+        return path if r.count('..') > 2 else r
     except Exception:
-        msg = str(exc)
-    logging.error(msg)
-    sys.exit(1)
+        return path
 
 
-def _set_volatile_home(path):
-    if not os.path.exists(path):
-        raise RuntimeError('Home path does not exists')
+@logaction
+def update_library(obfdist, libzip):
+    '''Update compressed library generated by py2exe or cx_Freeze, replace
+the original scripts with obfuscated ones.
 
-    import utils
-    home = os.path.abspath(path)
-    utils.PYARMOR_HOME = utils.HOME_PATH = home
-    utils.CROSS_PLATFORM_PATH = os.path.join(home, 'platforms')
-    utils.DEFAULT_CAPSULE = os.path.join(home, capsule_filename)
-    utils.OLD_CAPSULE = os.path.join(home, '..', capsule_filename)
-    if not os.getenv('PYARMOR_HOME', home) == home:
-        raise RuntimeError('The option --home conflicts with PYARMOR_HOME')
-    os.environ['PYARMOR_HOME'] = home
+    '''
+    # # It's simple ,but there are duplicated .pyc files
+    # with PyZipFile(libzip, 'a') as f:
+    #     f.writepy(obfdist)
+    filelist = []
+    for root, dirs, files in os.walk(obfdist):
+        filelist.extend([os.path.join(root, s) for s in files])
 
-    licfile = os.path.join(home, 'license.lic')
-    if os.path.exists(licfile):
-        logging.info('Copy home license %s', licfile)
-        logging.info('As volatile license to %s', PYARMOR_PATH)
-        shutil.copy(licfile, PYARMOR_PATH)
+    with PyZipFile(libzip, 'r') as f:
+        namelist = f.namelist()
+        f.extractall(obfdist)
 
+    for s in filelist:
+        if s.lower().endswith('.py'):
+            compile_file(s, s + 'c')
 
-def _clean_volatile_home():
-    licfile = os.path.join(PYARMOR_PATH, 'license.lic')
-    if os.path.exists(licfile):
-        logging.info('Clean volatile license file: %s', licfile)
-        os.remove(licfile)
+    with PyZipFile(libzip, 'w') as f:
+        for name in namelist:
+            f.write(os.path.join(obfdist, name), name)
 
 
-def main(argv):
-    parser = _parser()
-    args = parser.parse_args(argv)
-    if not hasattr(args, 'func'):
-        parser.print_help()
+@logaction
+def copy_runtime_files(runtimes, output):
+    for s in glob(os.path.join(runtimes, '*.key')):
+        shutil.copy(s, output)
+    for s in glob(os.path.join(runtimes, '*.lic')):
+        shutil.copy(s, output)
+    for dllname in glob(os.path.join(runtimes, '_pytransform.*')):
+        shutil.copy(dllname, output)
+
+
+def pathwrapper(func):
+    def wrap(*args, **kwargs):
+        oldpath = os.getcwd()
+        os.chdir(args[2])
+        logging.info('Change current path to %s', os.getcwd())
+        logging.info('-' * 50)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            os.chdir(oldpath)
+            logging.info('Restore current path to %s', oldpath)
+            logging.info('%s\n', '-' * 50)
+    return wrap
+
+
+@pathwrapper
+def run_setup_script(src, entry, build, script, packcmd, obfdist):
+    '''Update entry script, copy pytransform.py to source path, then run
+setup script to build the bundle.
+
+    '''
+    obf_entry = os.path.join(obfdist, entry)
+
+    tempfile = '%s.armor.bak' % entry
+    shutil.move(os.path.join(src, entry), tempfile)
+    shutil.move(obf_entry, src)
+    shutil.copy(os.path.join(obfdist, 'pytransform.py'), src)
+
+    try:
+        run_command([sys.executable, script] + packcmd)
+    finally:
+        shutil.move(tempfile, os.path.join(src, entry))
+        os.remove(os.path.join(src, 'pytransform.py'))
+
+
+def call_pyarmor(args):
+    s = os.path.join(os.path.dirname(__file__), 'pyarmor.py')
+    run_command([sys.executable, s] + list(args))
+
+
+def _packer(t, src, entry, build, script, output, options, xoptions, clean):
+    libname = DEFAULT_PACKER[t][1]
+    packcmd = DEFAULT_PACKER[t][2] + [relpath(output, build)] + options
+    script = 'setup.py' if script is None else script
+    check_setup_script(t, os.path.join(build, script))
+    if xoptions:
+        logging.warning('-x, -xoptions are ignored')
+
+    project = relpath(os.path.join(build, 'obf'))
+    obfdist = os.path.join(project, 'dist')
+
+    logging.info('obfuscated scrips output path: %s', obfdist)
+    logging.info('build path: %s', project)
+    if clean and os.path.exists(project):
+        logging.info('Remove build path')
+        shutil.rmtree(project)
+
+    logging.info('Run PyArmor to create a project')
+    call_pyarmor(['init', '-t', 'app', '--src', relpath(src),
+                  '--entry', entry, project])
+
+    logging.info('Run PyArmor to config the project')
+    filters = ('global-include *.py', 'prune build, prune dist',
+               'prune %s' % project,
+               'exclude %s pytransform.py' % entry)
+    args = ('config', '--runtime-path', '.', '--package-runtime', '0',
+            '--restrict-mode', '0', '--manifest', ','.join(filters), project)
+    call_pyarmor(args)
+
+    logging.info('Run PyArmor to build the project')
+    call_pyarmor(['build', '-B', project])
+
+    run_setup_script(src, entry, build, script, packcmd,
+                     os.path.abspath(obfdist))
+
+    update_library(obfdist, os.path.join(output, libname))
+
+    copy_runtime_files(obfdist, output)
+
+
+@logaction
+def check_setup_script(_type, setup):
+    if os.path.exists(setup):
         return
 
-    if args.silent:
-        logging.getLogger().setLevel(100)
-    if args.debug or sys.flags.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        sys._debug_pyarmor = True
-    elif os.path.basename(sys.argv[0]).split('.')[0] == 'pyarmor':
-        sys.excepthook = excepthook
-
-    if args.home:
-        logging.info('Set pyarmor home path: %s', args.home)
-        _set_volatile_home(args.home)
+    logging.info('Please run the following command to generate setup.py')
+    if _type == 'py2exe':
+        logging.info('\tpython -m py2exe.build_exe -W setup.py hello.py')
+    elif _type == 'cx_Freeze':
+        logging.info('\tcxfreeze-quickstart')
     else:
-        _clean_volatile_home()
-
-    if args.boot:
-        logging.info('Set boot platform: %s', args.boot)
-        os.environ['PYARMOR_PLATFORM'] = args.boot
-
-    if args.func.__name__[1:] not in ('register', 'download'):
-        pytransform_bootstrap(capsule=DEFAULT_CAPSULE, force=args.boot)
-
-    logging.info(_version_info(verbose=0))
-    logging.info('Python %d.%d.%d', *sys.version_info[:3])
-    args.func(args)
+        logging.info('\tvi setup.py')
+    raise RuntimeError('No setup script %s found' % setup)
 
 
-def main_entry():
+def _make_hook_pytransform(hookfile, obfdist, encoding=None):
+    # On Mac OS X pyinstaller will call mac_set_relative_dylib_deps to
+    # modify .dylib file, it results in the cross protection of pyarmor fails.
+    # In order to fix this problem, we need add .dylib as data file
+    p = obfdist + os.sep
+    lines = ['binaries=[(r"{0}_pytransform*", ".")]']
+
+    if encoding is None:
+        with open(hookfile, 'w') as f:
+            f.write('\n'.join(lines).format(p))
+    else:
+        with codecs_open(hookfile, 'w', encoding) as f:
+            f.write('\n'.join(lines).format(p))
+
+
+def _pyi_makespec(hookpath, src, script, packcmd, modname='pytransform'):
+    options = ['-p', hookpath, '--hidden-import', modname,
+               '--additional-hooks-dir', hookpath, os.path.join(src, script)]
+    cmdlist = packcmd + options
+    # cmdlist[:4] = ['pyi-makespec']
+    cmdlist[:4] = [sys.executable, '-m', 'PyInstaller.utils.cliutils.makespec']
+    run_command(cmdlist)
+
+
+def _guess_encoding(filename):
+    with open(filename, 'rb') as f:
+        line = f.read(80)
+        if line and line[0] == 35:
+            n = line.find(b'\n')
+            m = re.search(r'coding[=:]\s*([-\w.]+)', line[:n].decode())
+            if m:
+                return m.group(1)
+
+
+def _patch_specfile(obfdist, src, specfile, hookpath=None, encoding=None,
+                    modname='pytransform'):
+    if encoding is None:
+        with open(specfile, 'r') as f:
+            lines = f.readlines()
+    else:
+        with codecs_open(specfile, 'r', encoding) as f:
+            lines = f.readlines()
+
+    p = os.path.abspath(obfdist)
+    patched_lines = (
+        "", "# Patched by PyArmor",
+        "_src = %s" % repr(os.path.abspath(src)),
+        "_obf = 0",
+        "for i in range(len(a.scripts)):",
+        "    if a.scripts[i][1].startswith(_src):",
+        "        x = a.scripts[i][1].replace(_src, r'%s')" % p,
+        "        if os.path.exists(x):",
+        "            a.scripts[i] = a.scripts[i][0], x, a.scripts[i][2]",
+        "            _obf += 1",
+        "if _obf == 0:",
+        "    raise RuntimeError('No obfuscated script found')",
+        "for i in range(len(a.pure)):",
+        "    if a.pure[i][1].startswith(_src):",
+        "        x = a.pure[i][1].replace(_src, r'%s')" % p,
+        "        if os.path.exists(x):",
+        "            if hasattr(a.pure, '_code_cache'):",
+        "                with open(x) as f:",
+        "                    a.pure._code_cache[a.pure[i][0]] = compile(f.read(), a.pure[i][1], 'exec')",
+        "            a.pure[i] = a.pure[i][0], x, a.pure[i][2]",
+        "# Patch end.", "", "")
+
+    if encoding is not None and sys.version_info[0] == 2:
+        patched_lines = [x.decode(encoding) for x in patched_lines]
+
+    for i in range(len(lines)):
+        if lines[i].startswith("pyz = PYZ("):
+            lines[i:i] = '\n'.join(patched_lines)
+            break
+    else:
+        raise RuntimeError('Unsupport .spec file, no "pyz = PYZ" found')
+
+    if hookpath is not None:
+        for k in range(len(lines)):
+            if lines[k].startswith('a = Analysis('):
+                break
+        else:
+            raise RuntimeError('Unsupport .spec file, no "a = Analysis" found')
+        n = i
+        keys = []
+        for i in range(k, n):
+            if lines[i].lstrip().startswith('pathex='):
+                lines[i] = lines[i].replace('pathex=',
+                                            'pathex=[r"%s"]+' % hookpath, 1)
+                keys.append('pathex')
+            elif lines[i].lstrip().startswith('hiddenimports='):
+                lines[i] = lines[i].replace('hiddenimports=',
+                                            'hiddenimports=["%s"]+' % modname, 1)
+                keys.append('hiddenimports')
+            elif lines[i].lstrip().startswith('hookspath='):
+                lines[i] = lines[i].replace('hookspath=',
+                                            'hookspath=[r"%s"]+' % hookpath, 1)
+                keys.append('hookspath')
+        d = set(['pathex', 'hiddenimports', 'hookspath']) - set(keys)
+        if d:
+            raise RuntimeError('Unsupport .spec file, no %s found' % list(d))
+
+    patched_file = specfile[:-5] + '-patched.spec'
+    if encoding is None:
+        with open(patched_file, 'w') as f:
+            f.writelines(lines)
+    else:
+        with codecs_open(patched_file, 'w', encoding) as f:
+            f.writelines(lines)
+
+    return os.path.normpath(patched_file)
+
+
+def _pyinstaller(src, entry, output, options, xoptions, args):
+    '''
+    Args:
+        src: str - (absolute) or (relative to cwd) path for root;
+        entry: str - (absolute) or (relative to cwd) path for entry script;
+        output: str - (absolute) or (relative to cwd) path for pack output;
+        options: List[str] - options for pyinstaller
+        xoptions: List[str] - options for obfuscate
+        args - cli arguments
+    '''
+    clean = args.clean
+    licfile = args.license_file
+    if licfile in ('no', 'outer') or args.no_license:
+        licfile = False
+    src = relpath(src)
+    output = relpath(output)
+    obfdist = os.path.join(output, 'obf')
+    initcmd = DEFAULT_PACKER['PyInstaller'][2] + [output]
+    packcmd = initcmd + options
+    script = relpath(entry, start=src)
+
+    if not script.endswith('.py') or not os.path.exists(os.path.join(src, script)):
+        raise RuntimeError('No entry script %s found' % script)
+
+    if args.name:
+        packcmd.extend(['--name', args.name])
+    else:
+        args.name = os.path.basename(entry)[:-3]
+
+    specfile = args.setup
+    if specfile is None:
+        specfile = os.path.join(args.name + '.spec')
+        # In Windows, it doesn't work if specpath is not in same drive
+        # as entry script
+        # if hasattr(args, 'project'):
+        #     specpath = args.project
+        #     if specpath.endswith('.json'):
+        #         specpath = os.path.dirname(specpath)
+        #     packcmd.extend(['--specpath', specpath])
+        #     specfile = os.path.join(specpath, specfile)
+    elif not os.path.exists(specfile):
+        raise RuntimeError('No specfile %s found' % specfile)
+
+    logging.info('build path: %s', relpath(obfdist))
+    if clean and os.path.exists(obfdist):
+        logging.info('Remove build path')
+        shutil.rmtree(obfdist)
+
+    logging.info('Run PyArmor to obfuscate scripts...')
+    licargs = ['--with-license', licfile] if licfile else \
+        ['--with-license', 'outer'] if licfile is False else []
+    if hasattr(args, 'project'):
+        if xoptions:
+            logging.warning('Ignore xoptions as packing project')
+        call_pyarmor(['build', '-B', '-O', obfdist, '--package-runtime', '0']
+                     + licargs + [args.project])
+    else:
+        call_pyarmor(['obfuscate', '-O', obfdist, '--package-runtime', '0',
+                      '-r', '--exclude', output]
+                     + licargs + xoptions + [script])
+
+    obftemp = os.path.join(obfdist, 'temp')
+    if not os.path.exists(obftemp):
+        logging.info('Create temp path: %s', obftemp)
+        os.makedirs(obftemp)
+    supermode = True
+    runmodname = None
+    for x in glob(os.path.join(obfdist, 'pytransform*')):
+        nlist = os.path.basename(x).split('.')
+        if str(nlist[-1]) in ('py', 'so', 'pyd'):
+            logging.info('Found runtime module %s', os.path.basename(x))
+            if runmodname is not None:
+                raise RuntimeError('Too many runtime module found')
+            runmodname = nlist[0]
+            supermode = nlist[1] != 'py'
+            logging.info('Copy %s to temp path', x)
+            shutil.copy(x, obftemp)
+    if runmodname is None:
+        raise RuntimeError('No runtime module found')
+
+    if args.setup is None:
+        logging.info('Run PyInstaller to generate .spec file...')
+        _pyi_makespec(obftemp, src, script, packcmd, runmodname)
+        if not os.path.exists(specfile):
+            raise RuntimeError('No specfile "%s" found', specfile)
+        logging.info('Save .spec file to %s', specfile)
+        hookpath = None
+    else:
+        logging.info('Use customized .spec file: %s', specfile)
+        hookpath = obftemp
+
+    encoding = _guess_encoding(specfile)
+
+    hookfile = os.path.join(obftemp, 'hook-%s.py' % runmodname)
+    logging.info('Generate hook script: %s', hookfile)
+    if not supermode:
+        _make_hook_pytransform(hookfile, obfdist, encoding)
+
+    logging.info('Patching .spec file...')
+    patched_spec = _patch_specfile(obfdist, src, specfile, hookpath,
+                                   encoding, runmodname)
+    logging.info('Save patched .spec file to %s', patched_spec)
+
+    logging.info('Run PyInstaller with patched .spec file...')
+    run_command([sys.executable] + initcmd + ['-y', '--clean', patched_spec])
+
+    if not args.keep:
+        if args.setup is None:
+            logging.info('Remove .spec file %s', specfile)
+            os.remove(specfile)
+        logging.info('Remove patched .spec file %s', patched_spec)
+        os.remove(patched_spec)
+        logging.info('Remove build path %s', obfdist)
+        shutil.rmtree(obfdist)
+
+
+def _get_project_entry(project):
+    if project.endswith('.json'):
+        filename = project
+        path = os.path.dirname(project)
+    else:
+        path = project
+        filename = os.path.join(project, '.pyarmor_config')
+    if not os.path.exists(filename):
+        raise RuntimeError('No project %s found' % project)
+    with open(filename, 'r') as f:
+        obj = json_load(f)
+        src = obj['src']
+        if not src:
+            raise RuntimeError('No src in this project %s' % project)
+        if not os.path.isabs(src):
+            src = os.path.join(path, src)
+        if not os.path.exists(src):
+            raise RuntimeError('The project src %s does not exists' % project)
+        if not obj['entry']:
+            raise RuntimeError('No entry in this project %s' % project)
+        entry = obj['entry'].split(',')[0]
+    return src, entry
+
+
+def _check_extra_options(options):
+    for x in ('-y', '--noconfirm'):
+        if x in options:
+            options.remove(x)
+    for item in options:
+        for x in item.split('='):
+            if x in ('-n', '--name', '--distpath', '--specpath'):
+                raise RuntimeError('The option "%s" could not be used '
+                                   'as the extra options' % x)
+
+
+def _check_entry_script(filename):
+    try:
+        with open(filename) as f:
+            n = 0
+            for line in f:
+                if (line.startswith('__pyarmor') and
+                    line[:100].find('__name__, __file__') > 0) \
+                    or line.startswith('pyarmor(__name__, __file__'):
+                    return False
+                if n > 1:
+                    break
+                n + 1
+    except Exception:
+        # Ignore encoding error
+        pass
+
+
+def _get_src_from_xoptions(xoptions):
+    if xoptions is None:
+        return None
+
+    # src parameter for `obfuscate`
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-s', '--src', metavar='PATH', default=None)
+    args = parser.parse_known_args(xoptions)[0]
+    return args.src
+
+
+def packer(args):
+    t = args.type
+
+    xoptions = [] if args.xoptions is None else split(args.xoptions)
+    extra_options = [] if args.options is None else split(args.options)
+    _check_extra_options(extra_options)
+
+    if args.entry[0].endswith('.py'):
+        xoption_src = _get_src_from_xoptions(xoptions)
+        src = os.path.abspath(
+            os.path.dirname(args.entry[0])
+            if xoption_src is None else
+            xoption_src
+        )
+        entry = relpath(args.entry[0])
+    else:
+        src, entry = _get_project_entry(args.entry[0])
+        args.project = args.entry[0]
+
+    if _check_entry_script(os.path.abspath(entry)) is False:
+        raise RuntimeError('DO NOT pack the obfuscated script, please '
+                           'pack the original script directly')
+
+    if args.setup is None:
+        build = src
+        script = None
+    else:
+        build = os.path.abspath(os.path.dirname(args.setup))
+        script = os.path.basename(args.setup)
+
+    if args.output is None:
+        dist = DEFAULT_PACKER[t][0]
+        output = os.path.join(build, dist)
+    else:
+        output = os.path.abspath(args.output)
+    output = os.path.normpath(output)
+
+    logging.info('Prepare to pack obfuscated scripts with %s...', t)
+    logging.info('entry script: %s', entry)
+    logging.info('src for searching scripts: %s', relpath(src))
+
+    if t == 'PyInstaller':
+        _pyinstaller(src, entry, output, extra_options, xoptions, args)
+    else:
+        logging.warning('Deprecated way, use PyInstaller instead')
+        _packer(t, src, entry, build, script, output,
+                extra_options, xoptions, args.clean)
+
+    logging.info('Final output path: %s', relpath(output))
+    logging.info('Pack obfuscated scripts successfully.')
+
+
+def add_arguments(parser):
+    parser.add_argument('-v', '--version', action='version', version='v0.1')
+
+    parser.add_argument('-t', '--type', default='PyInstaller', metavar='TYPE',
+                        choices=DEFAULT_PACKER.keys(), help=argparse.SUPPRESS)
+    parser.add_argument('-s', '--setup', metavar='FILE',
+                        help='Use external .spec file to pack the script')
+    parser.add_argument('-n', '--name', help='Name to assign to the bundled '
+                        'app (default: first script’s basename)')
+    parser.add_argument('-O', '--output', metavar='PATH',
+                        help='Directory to put final built distributions in')
+    parser.add_argument('-e', '--options', metavar='EXTRA_OPTIONS',
+                        help='Pass these extra options to `pyinstaller`')
+    parser.add_argument('-x', '--xoptions', metavar='EXTRA_OPTIONS',
+                        help='Pass these extra options to `pyarmor obfuscate`')
+    parser.add_argument('--no-license', '--without-license',
+                        action='store_true', dest='no_license',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--with-license', metavar='FILE', dest='license_file',
+                        help='Use this license file other than default one')
+    parser.add_argument('--clean', action="store_true",
+                        help='Remove cached .spec file before packing')
+    parser.add_argument('--keep', '--debug', dest='keep', action="store_true",
+                        help='Do not remove build files after packing')
+    parser.add_argument('entry', metavar='SCRIPT', nargs=1,
+                        help='Entry script or project path')
+
+
+def main(args):
+    parser = argparse.ArgumentParser(
+        prog='packer.py',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Pack obfuscated scripts',
+        epilog=__doc__,
+    )
+    add_arguments(parser)
+    packer(parser.parse_args(args))
+
+
+if __name__ == '__main__':
     logging.basicConfig(
         level=logging.INFO,
         format='%(levelname)-8s %(message)s',
     )
     main(sys.argv[1:])
-
-
-if __name__ == '__main__':
-    main_entry()
